@@ -1,0 +1,27 @@
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+settings.json
+settings.local.json
+config.toml
+
+# Local task storage and generated output
+.cli-baton/
+**/runs/
+prompt.txt
+reply.txt
+stdout.jsonl
+stderr.log
+meta.json
+result.json
+supervisor.json
+heartbeat.json
+cancel.json
+*.log
+*.bak*
+
+# Development and OS files
+node_modules/
+coverage/
+.DS_Store
