@@ -33,6 +33,9 @@
 - **后台 detached supervisor**：MCP 服务器重启/退出不影响运行中的任务；重启后仍可继续查询。
 - **会话恢复**：把上一条运行返回的 `session_id` 传给下一次 `send`，即可在同一会话中继续对话。
 - **完整可观测性**：状态机、stdout 原始事件尾行、stderr 尾部、usage、run 目录落盘。
+- **实时进度窗口（macOS）**：每个 run 自动开一个 Terminal 窗口跟随 `stdout.jsonl`，逐字显示 CLI 正在写的内容；终态自动关窗；`CLI_BATON_VIEWER=0` 可关闭。
+- **对话模式（两个后端）**：窗口里（或 `<p>_say`）可以随时插话，每个回合各有一条 `turns[]` 记录。agy 保持一个长连接进程（消息写 stdin），**一段对话最多 2 轮**（`CLI_BATON_AGY_MAX_TURNS` 可改）；codex 每个 turn 一个新进程（`exec resume <thread_id>`），**轮数不限**。没有窗口时**不进入等待输入的宽限期**，最后一个 turn 结束即完成（其间仍可用 `<p>_say` 追加消息）。
+- **卡死检测**：`_status` / `_wait` 返回 `idle_s`、`stdout_bytes`、`event_count`、`last_event`；配 `stall_s` 时 `_wait` 在长时间无输出后立即返回 `stalled: true`（不杀进程）。
 - **权限可控**：默认 `access=full`（两个后端一致），也可显式指定 `read-only`。
 - **本地记录与部分脱敏**：不主动序列化环境变量；返回的错误和日志尾部按规则脱敏，完整回复与原始日志不保证脱敏；超长回复截断并落盘完整版本；状态目录 0700、文件 0600。
 - **可恢复的状态存储**：原子 JSON 写入，避免读到半写状态。
@@ -49,6 +52,14 @@ MCP client ──stdio(逐行 JSON-RPC)──▶ src/server.mjs
                               src/runner.mjs（后台执行器：启动 CLI、写事件、超时/取消）
                                         │ 通过 adapter 构造命令行
                               src/backends/{agy,codex}.mjs
+
+runner ──stdin NDJSON──▶ agy（对话模式：每条消息一个 turn）
+   │  ▲
+   │  └── inbox.jsonl ◀── viewer 输入行 / <p>_say
+   │
+runner ──osascript──▶ src/viewer-window.mjs（macOS 弹窗/关窗）──▶ Terminal.app
+                                                    │ 运行
+                                          src/viewer.mjs（跟随 stdout.jsonl 实时渲染）
 ```
 
 | 文件 | 职责 |
@@ -60,7 +71,10 @@ MCP client ──stdio(逐行 JSON-RPC)──▶ src/server.mjs
 | `src/backends/agy.mjs` | agy 适配器：可执行文件发现、argv 构造、输出解析、模型列表。 |
 | `src/backends/codex.mjs` | codex 适配器：可执行文件发现、argv 构造、输出解析、模型列表。 |
 | `src/backends/index.mjs` | 极简注册表：后端名 → adapter。 |
-| `tests/helpers.mjs`、`tests/fixtures/` | 测试用的 MCP 客户端封装与 fake CLI 夹具。 |
+| `src/viewer.mjs` | 实时进度查看器（`node src/viewer.mjs <run_dir>`）：跟随 `stdout.jsonl` / `stderr.log`，把 agy 的 `stream-json` 事件与 codex 的 `--json` 事件渲染成人能读的文字，终态后自行退出。 |
+| `src/chat.mjs` | 与后端无关的对话层：`inbox.jsonl` 跟随、排队、`turns`、宽限期策略（`CLI_BATON_CHAT_GRACE_S`）、agy 的 stdin 消息格式。 |
+| `src/viewer-window.mjs` | macOS 弹窗/关窗桥：用 AppleScript 新建 Terminal 窗口跑 viewer、记录窗口 id、终态时先结束 viewer 再关窗；任何失败只写 `viewer.log`。 |
+| `tests/helpers.mjs`、`tests/fixtures/` | 测试用的 MCP 客户端封装与 fake CLI 夹具（fake-agy 支持 `stream-json`、`silent`、`chatty` 等模式；fake-osascript 记录弹窗/关窗调用）。 |
 | `tests/*.test.mjs` | 使用 fake CLI 的协议/可靠性测试（`node --test`）。 |
 | `tests/live.mjs` | 真实 CLI 冒烟测试（手动运行，消耗真实配额）。 |
 
@@ -93,6 +107,8 @@ node tests/live.mjs --backend codex             # 真实 CLI 冒烟测试（会�
 node tests/live.mjs                             # agy + codex 全部用例
 ```
 
+> 手动 live 测试默认也会弹实时窗口；不想弹就在前面加 `CLI_BATON_VIEWER=0`。
+>
 > `tests/live.mjs` 是手动测试：每个用例 180 秒硬超时（`resume-memory` 含两次顺序 CLI 调用，放宽为 2×180 秒；每次调用仍受 `timeout_s:150` 的 run 超时约束），逐个打印 `PASS`/`FAIL`，最后输出汇总表；全部通过时退出码为 0。某个后端不可用（例如 agy 所在环境没有网络）时，该后端的每个用例会在 180 秒内以 `FAIL` 结束，不会挂住整个套件。
 
 ### Claude Code
@@ -139,6 +155,7 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 | `effort` | string | — | — | `low` / `medium` / `high` / `xhigh` / `max`。 |
 | `access` | string | — | `full` | `read-only` 或 `full`；**两个后端默认都是 full**。 |
 | `timeout_s` | number | — | `3600` | 本次 run 的运行超时，范围 10..86400；到期由 supervisor 终止 CLI 并标记 `timed_out`。 |
+| `stall_s` | number | — | 不设置 | 卡死判定阈值（秒，1..86400），记录在 run 上；运行中且 `idle_s > stall_s` 时 `_wait` 立即返回 `stalled: true`。**只报告，不杀进程**。 |
 
 ### `<p>_send`
 
@@ -150,6 +167,22 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 
 `state` 是提交瞬间的状态（通常 `queued` 或 `running`）；之后用 `_wait` / `_status` 获取终态。
 
+传了 `stall_s` 时，该阈值写入 `meta.json`；之后调用 `_wait` 不传 `stall_s` 也会沿用它。
+
+- 两个后端的 run 都是**对话**（chat）：`send` 的 message 是第一个 turn。之后可以用 `<p>_say` 继续插话；带窗口时最后一个 turn 结束后还会有一个宽限期（见“对话模式”）。
+- 区别只在“下一条消息怎么发”：**agy** 写入同一个常驻进程的 stdin；**codex** 每个 turn 启动一次 `codex exec resume --json … <thread_id>`（thread id 来自上一轮 `thread.started`）。
+
+### `<p>_say`
+
+向**正在运行**的对话追加一条消息。消息写入 `run_dir/inbox.jsonl`（`source: "caller"`），排在当前 turn 之后执行；不会打断正在生成的回复。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `run_id` | string | ✅ | 运行中的对话 run（两个后端都支持）。 |
+| `text` | string | ✅ | 追加的对话内容。 |
+
+返回与 `_status` 相同，另加 `say: { queued: true, at, source: "caller", inflight }`。run 已结束、id 不存在、text 为空都会返回明确的工具错误；对话已收尾（`stdin_closed: true`）时也会明确拒绝，而不是假装排队。
+
 ### `<p>_wait`
 
 等待 run 进入终态（或等待超时）。
@@ -158,6 +191,7 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 | --- | --- | --- | --- | --- |
 | `run_id` | string | ✅ | — | `send` 返回的 id。 |
 | `timeout_s` | number | — | `240` | 本次**等待**的切片时长，范围 1..540；它不会终止 run。超时返回时带 `timed_out: true`，继续调用即可。 |
+| `stall_s` | number | — | 沿用 run 上记录的值 | 卡死判定阈值（秒）；运行中且 `idle_s > stall_s` 时立即返回 `stalled: true`（不杀进程），便于上层决定“继续等 / 取消”。 |
 
 返回字段：
 
@@ -178,6 +212,19 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 | `stderr_tail` | CLI stderr 尾部（已脱敏）。 |
 | `reply_truncated` | 布尔值；reply 超过 100000 字符时为 true，此时完整回复在 `run_dir/reply.txt`。 |
 | `timed_out` | 布尔值；仅当 `_wait` 等待超时（不是 run 超时）时出现。 |
+| `stalled` | 布尔值；仅当“运行中且 `idle_s > stall_s`”触发时出现（值为 `true`），此时 `stall_s` / `idle_s` 一并返回。 |
+| `last_output_at` | ISO 时间；CLI 最近一次往 stdout/stderr 写输出的时间（未开始时为 null）。 |
+| `stdout_bytes` | 数字；`stdout.jsonl` 已写入的字节数。 |
+| `event_count` | 数字；已写入的 JSON 事件条数。 |
+| `last_event` | 字符串；最后一条事件的 `event`（agy）或 `type`（codex），非 JSON 行为 `raw`。 |
+| `idle_s` | 数字；距最后一次输出的秒数（0.1 精度），用于判断“在思考”还是“卡住”。 |
+| `turns` | 数组；每个 turn 一条 `{user_text, source: "caller"\|"window", reply, status, duration_s, at}`（reply 超 20000 字符会截断并带 `reply_truncated`）。两个后端都是对话，因此单次 `send` 至少有一条。 |
+| `chat` | 布尔；该 run 是否是对话（两个后端都是）。 |
+| `inflight` | 布尔；当前是否有一个 turn 正在生成（此时插话会排队）。 |
+| `grace_until` / `grace_remaining_s` | 宽限期的截止时间 / 剩余秒数；没有宽限期时为 null。 |
+| `stdin_closed` | 布尔；对话已收尾（agy 的 stdin 关闭 / codex 不再启动新 turn），此时 `<p>_say` 会明确报错而不是假装排队。 |
+| `max_turns` / `turns_used` / `turns_remaining` | 该段对话的轮数上限（codex 为 null）、已用轮数、剩余轮数。 |
+| `max_turns_reached` | 布尔；已达上限，此时 `<p>_say` 返回 `max_turns_reached`，窗口输入被禁用。 |
 
 ### `<p>_status`
 
@@ -188,7 +235,7 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 | `run_id` | string | ✅ | — | `send` 返回的 id。 |
 | `tail` | number | — | `5` | 返回最近多少条原始事件行，最大 50。 |
 
-返回字段与 `_wait` 相同，另加：
+返回字段与 `_wait` 相同（含 `last_output_at` / `stdout_bytes` / `event_count` / `last_event` / `idle_s`），另加：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -245,6 +292,64 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 - agy 的 `read-only` 映射为 CLI 的计划模式，是否限制所有写入取决于该 CLI；cli-baton 自身不提供操作系统级沙箱。
 - 请在受控环境中使用；`full` 下的行为等同于你本人执行 CLI 命令。
 
+## 实时进度窗口（macOS）
+
+每个 run 在 macOS 上会自动开一个小窗口显示实时进度，代替“盯着空文件猜是不是卡死”。
+
+- **何时弹出**：supervisor 启动 CLI 子进程后，用 `osascript` 让 Terminal.app 新开一个窗口执行
+  `node <cli-baton 绝对路径>/src/viewer.mjs '<run_dir>'`，窗口标题为 `cli-baton · <backend> · <run_id 前 8 位>`。
+  不会调用 `activate`，尽量不抢当前前台焦点。
+- **显示什么**：开头是 backend / model / effort / access / cwd / run_id；agy 的 `text_delta` 连续打印，
+  `step_type` 变化与工具调用各打一行带时间戳的标记（工具行显示工具名），`result` 显示 status、用时与 token；
+  codex 的 `thread.started` / `item.completed` / `turn.completed` 同样被翻译成可读行；不认识的 JSON 行压缩成一行。
+  每 5 秒无新输出时在底部状态行显示“仍在运行，已 Ns 无新输出，进程 pid 存活/已退出”（读 `heartbeat.json` / `meta.json`）。
+- **何时关闭**：run 进入终态（`completed` / `failed` / `cancelled` / `timed_out` / `interrupted`）后，viewer 自己打印最终状态并退出；
+  supervisor 先确保 viewer 进程结束（最多等 3 秒，否则直接结束它），再用 `osascript` 按 `viewer.json` 里记录的窗口 id 关闭该窗口。
+  若关闭时该 tab 仍有前台进程，先让 shell 退出再关窗，避免弹出“是否终止进程”的确认框；窗口已被用户手动关闭时静默忽略。
+- **随时手动看**：run 跑着或已经跑完都可以
+
+  ```bash
+  node src/viewer.mjs ~/.cli-baton/agy/runs/<run_id>
+  ```
+
+  它会从头重放 `stdout.jsonl`，然后继续跟随，直到读到终态。
+- **关掉这个功能**：`CLI_BATON_VIEWER=0`（也接受 `false` / `off` / `no`）时完全不弹窗；非 macOS 平台永远不弹。
+- **失败隔离**：任何 `osascript` / viewer 失败只会追加到 run 目录的 `viewer.log`，**不会**让 run 失败或改变 run 结果。
+
+## 对话模式（agy / codex）
+
+两个后端共用同一套对话层（收件箱 / 排队 / `turns` / 宽限 / 窗口输入），只在下发方式上不同：
+
+- **agy**：长连接。`--input-format stream-json --output-format stream-json … -p=`，从 stdin 逐行读 NDJSON（`{"event":"user","message":{"content":[{"type":"text","text":"…"}]}}`），每条消息跑一个 turn，stdin 不关进程就不退出。第一个 turn 就是 `send` 的 `message`（不再走 argv，`meta.json` 的 argv 里只有 `-p=`）。
+- **codex**：一次一个进程。第一个 turn 是 `codex exec --json --skip-git-repo-check -`，进程结束即该 turn 结束；后续消息用 `codex exec resume --json --skip-git-repo-check <thread_id> -`（thread id 取自 `thread.started`）。每次 resume 的事件继续追加到**同一个** `stdout.jsonl`，作为同一个 run 的新 turn。
+
+- **插话的三种入口**：窗口底部输入行、直接追加 `run_dir/inbox.jsonl`、MCP 工具 `<p>_say`。runner 每 200ms 跟随收件箱，把新行下发并把 `{"event":"user_injected",…}` 记进 `stdout.jsonl`（viewer 会显示“插话 · 窗口/调用方”）。
+- **codex 的宽限期**：turn 结束后进程已经退出，所以宽限期内 runner 只保留 run（不再有进程）；有新消息就启动下一次 resume，没有就到期收尾。取消/超时在“无进程”的宽限期内会直接结束 run。
+- **轮数上限（agy 默认 2）**：计数包含调用方 prompt、`session_id` 续接（按已用 1 轮计）、`<p>_say` 与窗口输入。达到上限后：
+  - 窗口底部显示“本段对话已达 N 轮上限，请让 Claude 开新对话”，输入框禁用；
+  - `<p>_say` 立即返回工具错误，`error` 就是 `max_turns_reached`，消息**不会**写入收件箱或 stdin；
+  - 宽限期直接跳过：最后一个 turn 结束就关 stdin、完成 run、关窗。
+  程序化直接追加 `inbox.jsonl` 越过上限时，runner 会拒收并记一条 `{"event":"user_rejected",…,"reason":"max_turns_reached"}`，不会变成 turn。
+- **排队**：一个 turn 正在进行时，新消息只入队，等该 turn 的 `result` 到达后再发送，绝不打断生成。
+- **每个 turn 一条记录**：`turns.json` 落盘，`_status` / `_wait` 的 `turns[]` 实时可读；`reply` 始终是最后一个 turn 的回复。
+- **宽限期**：最后一个 turn 结束且收件箱为空时，若窗口已启用（macOS 且 `CLI_BATON_VIEWER≠0`），进入 `CLI_BATON_CHAT_GRACE_S`（默认 20 秒）宽限：
+  - 窗口底部显示“完成；N 秒内输入可继续对话，否则自动关闭”并每秒刷新；
+  - 宽限期内有输入 → 取消宽限、继续 `running`，`_wait` 继续等新 turn；
+  - 宽限期满 → 关闭 agy stdin → agy 退出 → run 记为 `completed` → 按既有逻辑关窗。
+- **没有窗口时不进宽限**：`CLI_BATON_VIEWER=0` 或非 macOS，最后一个 turn 结束就完成（agy 关 stdin、codex 直接收尾），行为与加对话模式之前一致（无人值守不会被 20 秒吊住）。
+- **取消 / 超时 / stall**：与之前一致；取消与超时会结束进程并关窗。宽限期是“故意在等用户输入”，因此宽限期内不会因为 `idle_s` 增长而报 `stalled`（避免把等人误判成卡死）；turn 进行中或宽限结束后的无输出仍按原来的 `stall_s` 语义处理。
+
+## 卡死检测（stall）
+
+CLI 有可能长时间没有任何输出。supervisor 会记录进度，工具把它换算成 `idle_s`，让调用方区分“在思考”和“卡住”：
+
+- supervisor 在**最多每秒一次**的节流下，把 `last_output_at`、`stdout_bytes`、`event_count`、`last_event` 写进
+  `heartbeat.json`（输出很密时不会变成写风暴；run 结束时强制刷新一次最终值）。
+- `_status` / `_wait` 返回这些字段以及 `idle_s` = 距最后一次输出的秒数。
+- `_send` 可传 `stall_s`（秒），`_wait` 也可传（不传就用 run 上记录的值）。当 run 仍 `running` 且 `idle_s > stall_s` 时，
+  `_wait` **立即**返回 `stalled: true`，而不是阻塞到等待超时。
+- **只报告、不杀进程**：`stalled` 只是提示；进程继续跑，可以再调 `_status` 观察，或按需 `_cancel`。
+
 ## 状态与可靠性
 
 ### 状态
@@ -266,6 +371,8 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 - **取消**：`_cancel` 对 supervisor/CLI 进程组先发 `SIGTERM`（约 5 秒宽限），再 `SIGKILL`；已结束的运行直接返回当前状态，不报错。
 - **会话并发拒绝**：同一个 `session_id` 同时只允许一个运行；并发提交第二个会收到明确错误，避免上下文互相污染。
 - **原子写入**：状态 JSON 采用“临时文件 + rename”，读方不会看到半写内容。
+- **输出即落盘**：agy 以 `--output-format stream-json`（逐行 NDJSON）运行，codex 以 `--json`（逐行 JSONL）运行；supervisor 按 chunk 同步写入 `stdout.jsonl`，所以运行中就能看到事件，实时窗口与 `idle_s` 都基于它。
+- **实时窗口失败隔离**：弹窗/关窗全部 best effort，异常只进 `viewer.log`；窗口不存在、Terminal 不可脚本化、viewer 提前退出都不会影响 run 状态与结果。
 - **超时分层**：run 的 `timeout_s`（默认 3600）决定任务最长运行时间，到期由 supervisor 终止并标记 `timed_out`；`_wait` 的 `timeout_s`（默认 240）只是本次等待的切片长度，不会终止任务，超时返回后继续调用即可。
 
 ## 存储布局
@@ -280,17 +387,21 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
         meta.json                 # 运行元数据：cwd、access、model、effort、argv、时间等
         prompt.txt                # 提示词全文
         supervisor.json           # supervisor pid + start token
-        heartbeat.json            # supervisor 运行期间定期刷新
+        heartbeat.json            # supervisor 运行期间刷新（含 last_output_at/stdout_bytes/event_count/last_event）
         cancel.json               # 仅当取消进行中时出现
         stdout.jsonl              # CLI stdout 原始事件流（每行一条）
         stderr.log                # CLI stderr
         reply.txt                 # 完整回复（始终写入；无回复时为空）
         result.json               # 最终结果快照（包含完整 reply）
+        inbox.jsonl               # 对话收件箱：每行 {"text","at","source"}（窗口/<p>_say 追加，runner 跟随）
+        turns.json                # 已完成 turn 的完整记录（user_text/source/reply/status/duration_s）
+        viewer.json               # 实时窗口：window_id、opened_at、pid、closed_at（仅 macOS 弹窗时出现）
+        viewer.log                # 实时窗口的 open/close 与失败记录（仅 macOS 弹窗时出现）
 ```
 
 - **权限**：目录 `0700`，文件 `0600`，仅当前用户可访问。
 - **提示词在状态文件与进程参数中的处理**：
-  - agy 的提示词作为 argv 值传入（运行期间本机进程列表可能看到，受本机权限限制），`meta.json` 中该 token 记录为字面量 `<prompt>`；
+  - agy 走对话模式：提示词作为**第一条 stdin 消息**传入，argv 里只有空值 token `-p=`（`meta.json` 的 argv 同样只记录 `-p=`），进程列表看不到提示词；
   - codex 的提示词通过 stdin 传入（argv 最后一个 token 为 `-`），提示词不出现在 argv 中；
   - 两种情况下都会把提示词全文写入 `prompt.txt`（0600）；CLI 输出也可能重复包含提示词或工作文件内容。
 
@@ -303,6 +414,12 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 | `CLI_BATON_HOME` | 存储根目录，默认 `~/.cli-baton`。 |
 | `AGY_BIN` | agy 可执行文件路径覆盖。不设置时依次查找：`PATH` → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`。 |
 | `CODEX_BIN` | codex 可执行文件路径覆盖。查找顺序同 `AGY_BIN`。 |
+| `CLI_BATON_VIEWER` | `0` / `false` / `off` / `no` 时关闭 macOS 实时进度窗口；默认开启（非 macOS 永远不弹）。 |
+| `CLI_BATON_OSASCRIPT_BIN` | 覆盖 `osascript` 可执行文件路径（测试/调试用）。 |
+| `CLI_BATON_VIEWER_POLL_MS` | viewer 的轮询间隔（毫秒，默认 500），主要供测试使用。 |
+| `CLI_BATON_VIEWER_IDLE_MS` | viewer 多久无输出后显示底部状态行（毫秒，默认 5000）。 |
+| `CLI_BATON_CHAT_GRACE_S` | 对话最后一个 turn 结束后的宽限秒数（默认 20；`0` 或负值表示不等待；仅在开窗时生效，两个后端一致）。 |
+| `CLI_BATON_AGY_MAX_TURNS` | agy 一段对话的最大轮数，默认 `2`（初始消息 + 1 条追加）。`0` / `inf` / `unlimited` 表示不限；只影响 agy，codex 永远不限。 |
 
 - **代理自动继承**：`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 等环境变量由服务器进程原样传给 CLI 子进程；cli-baton 不硬编码任何代理。
 - 子进程继承 MCP 服务进程的环境，包含 CLI 运行所需的认证和代理变量；服务不会主动把整个环境写入状态文件。CLI 自己输出的内容仍可能进入原始日志。
@@ -319,6 +436,7 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 ## 平台
 
 - **macOS**：主要支持平台（已按 macOS 的进程组、posix 权限、SIGTERM/SIGKILL 语义实现）。
+- **macOS 实时窗口**：仅 macOS 会自动弹窗（`osascript` + Terminal.app）；其它平台不弹，但 `node src/viewer.mjs <run_dir>` 仍可手动使用。对话宽限期只在开窗时生效，其它平台行为是“每个 turn 结束即完成”。
 - **Linux**：预期以相同方式工作。
 - **Windows**：尽力而为——会处理 `.cmd` / `.exe` 形式的可执行文件并尝试用 `taskkill` 终止进程树，但**未经测试**，不作为保证。
 

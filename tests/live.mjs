@@ -678,7 +678,13 @@ async function main() {
   const homeDir = mkdtempSync(path.join(tmpdir(), "cli-baton-live-home-"));
   CLEANUP_DIRS.push(homeDir);
   // Inherit the real environment (proxy, PATH, ...); only redirect storage.
-  const env = { ...process.env, CLI_BATON_HOME: homeDir };
+  const env = {
+  ...process.env,
+  CLI_BATON_HOME: homeDir,
+  // Manual smoke test: no Terminal windows, and no chat grace wait between turns.
+  CLI_BATON_VIEWER: "0",
+  CLI_BATON_CHAT_GRACE_S: "0",
+};
 
   const results = [];
   try {

@@ -16,16 +16,18 @@ const sandboxReadOnly = "sandbox_mode=" + Q + "read-only" + Q;
 const approvalNever = "approval_policy=" + Q + "never" + Q;
 const effortHigh = "model_reasoning_effort=" + Q + "high" + Q;
 
-test("agy buildInvocation: default access is full, prompt is an argv value, stdin ignored", () => {
+test("agy buildInvocation: conversation mode, prompt goes through stdin, no bare -p", () => {
   const invocation = agy.buildInvocation({ prompt: "hello", cwd: "/tmp/work" });
   assert.equal(agy.defaultAccess, "full");
-  assert.equal(invocation.stdin, "ignore");
-  assert.equal(invocation.args[0], "-p");
-  assert.equal(invocation.args[1], "hello");
-  assert.ok(invocation.args.includes("--output-format"));
-  assert.ok(invocation.args.includes("json"));
-  assert.ok(invocation.args.includes("--print-timeout"));
-  assert.ok(invocation.args.includes("0"));
+  // agy now runs as a long-lived conversation: stdin stays open for more turns.
+  assert.equal(invocation.stdin, "chat");
+  assert.equal(invocation.args[0], "--input-format");
+  assert.equal(invocation.args[1], "stream-json");
+  assert.equal(invocation.args[invocation.args.indexOf("--output-format") + 1], "stream-json");
+  assert.ok(invocation.args.includes("-p="), "-p= must stay a single empty-value token");
+  assert.ok(!invocation.args.includes("-p"), "a bare -p would swallow the next argument");
+  assert.ok(!invocation.args.includes("hello"), "the prompt must not travel through argv");
+  assert.equal(invocation.args[invocation.args.length - 1], "-p=");
   assert.ok(invocation.args.includes("--dangerously-skip-permissions"));
   assert.ok(!invocation.args.includes("--mode"));
 });
@@ -42,9 +44,10 @@ test("agy buildInvocation: read-only uses --mode plan, resume uses --conversatio
   assert.ok(!invocation.args.includes("-c"));
 });
 
-test("agy buildInvocation: leading-dash prompts stay in one argv token", () => {
+test("agy buildInvocation: leading-dash prompts never reach argv at all", () => {
   const invocation = agy.buildInvocation({ prompt: "-please do it", cwd: "/tmp/work" });
-  assert.equal(invocation.args[invocation.args.indexOf("-p") + 1], "-please do it");
+  assert.ok(!invocation.args.some((argument) => argument.includes("please do it")));
+  assert.equal(invocation.prompt, "-please do it", "the runner sends it as the first stdin message");
 });
 
 test("codex buildInvocation: new session defaults to full and reads prompt from stdin", () => {

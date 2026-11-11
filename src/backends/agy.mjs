@@ -8,6 +8,9 @@ export const displayName = "Antigravity CLI (agy)";
 export const envBinVar = "AGY_BIN";
 export const binaryName = "agy";
 export const defaultAccess = "full";
+// How this CLI receives the next conversation turn: agy keeps one process and
+// reads stdin NDJSON; codex is one process per turn and resumes by thread id.
+export const chatMode = "stdin";
 
 const SEARCH_DIRS = [
   ["home-local-bin", "~/.local/bin"],
@@ -78,13 +81,21 @@ export function executableNotFoundMessage(env = process.env) {
 }
 
 /**
- * Build the argv for one agy print-mode run.
- * Returns { args, stdin } where stdin === "prompt" means the runner must feed
- * prompt.txt to the child; "ignore" means /dev/null.
+ * Build the argv for one agy run in conversation mode.
+ *
+ *   agy --input-format stream-json --output-format stream-json [--model m]
+ *       [--effort e] [--conversation id] [--mode plan | --dangerously-skip-permissions] -p=
+ *
+ * agy then reads one NDJSON message per turn from stdin and stays alive while
+ * stdin is open; each turn ends with an `event:"result"` line. `-p=` must be a
+ * single empty-value token: a bare `-p` would swallow the next argument.
+ *
+ * Returns { args, stdin: "chat" }: the runner keeps stdin open and writes the
+ * prompt (and every later message) as a user event.
  */
 export function buildInvocation({ prompt, cwd, sessionId, model, effort, access } = {}) {
   const accessMode = access || defaultAccess;
-  const args = ["-p", prompt, "--output-format", "json", "--print-timeout", "0"];
+  const args = ["--input-format", "stream-json", "--output-format", "stream-json"];
   if (sessionId) args.push("--conversation", sessionId);
   if (model) args.push("--model", model);
   if (effort) args.push("--effort", effort);
@@ -93,7 +104,8 @@ export function buildInvocation({ prompt, cwd, sessionId, model, effort, access 
   } else {
     args.push("--dangerously-skip-permissions");
   }
-  return { args, stdin: "ignore" };
+  args.push("-p=");
+  return { args, stdin: "chat", prompt };
 }
 
 function tryParseJson(text) {
@@ -137,11 +149,68 @@ function firstLine(text, limit = 400) {
 }
 
 /**
+ * Parse agy `--output-format stream-json` output: one JSON event per line.
+ *
+ *   {"event":"init","conversation_id":"…","init":{…}}
+ *   {"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"…"}}
+ *   {"event":"result","result":{… same shape as --output-format json …}}
+ *
+ * Returns the last `result` payload (if any), every text_delta concatenated,
+ * and whether any stream event was seen at all. Non-JSON lines and objects
+ * without an `event` field are ignored so a mixed/legacy stdout still works.
+ */
+export function parseStreamEvents(stdout) {
+  let sawStream = false;
+  let resultObject = null;
+  let deltas = "";
+  let deltaCount = 0;
+  let eventCount = 0;
+  const steps = [];
+  for (const rawLine of String(stdout || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const value = tryParseJson(line);
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const event = typeof value.event === "string" ? value.event : null;
+    if (!event) continue;
+    sawStream = true;
+    eventCount += 1;
+    if (event === "result") {
+      const inner = value.result;
+      if (inner && typeof inner === "object" && !Array.isArray(inner)) resultObject = inner;
+    } else if (event === "step_update") {
+      const step = value.step_update;
+      if (!step || typeof step !== "object" || Array.isArray(step)) continue;
+      steps.push(step);
+      if (typeof step.text_delta === "string" && step.text_delta) {
+        deltas += step.text_delta;
+        deltaCount += 1;
+      }
+    }
+  }
+  return { sawStream, resultObject, deltas, deltaCount, steps, eventCount };
+}
+
+/**
  * Map agy stdout/stderr/exit code to a normalized parser result.
  * state is "completed" or "failed"; the runner overrides for cancel/timeout.
+ *
+ * Accepts both agy output formats:
+ *  - NDJSON stream (`--output-format stream-json`): the last `event:"result"`
+ *    payload is mapped exactly like the legacy single JSON object.
+ *  - legacy single JSON object (`--output-format json`), kept for older agy
+ *    builds and for test fixtures.
+ * A stream that ends without a `result` event falls back to the concatenated
+ * text_delta output and reports an explicit error.
  */
 export function parseOutput({ stdout, stderr, exitCode } = {}) {
-  const parsed = extractJsonResult(stdout);
+  const stream = parseStreamEvents(stdout);
+  // A detected stream is authoritative: only its `result` event is the reply
+  // source. Falling back to the legacy scanner here would mis-read the `init`
+  // event (it also carries conversation_id) as a result object.
+  const parsed = stream.sawStream ? stream.resultObject : extractJsonResult(stdout);
+  const streamWithoutResult = stream.sawStream && !stream.resultObject;
+
   let sessionId = null;
   let usage = null;
   let reply = "";
@@ -156,6 +225,7 @@ export function parseOutput({ stdout, stderr, exitCode } = {}) {
     if (typeof parsed.status === "string") status = parsed.status;
     if (parsed.error !== undefined && parsed.error !== null) backendError = String(parsed.error);
   }
+  if (!parsed && streamWithoutResult && stream.deltas) reply = stream.deltas;
 
   let state = "completed";
   let error = null;
@@ -168,15 +238,30 @@ export function parseOutput({ stdout, stderr, exitCode } = {}) {
   } else if (status && status.toUpperCase() !== "SUCCESS") {
     state = "failed";
     error = backendError || "agy reported status " + status;
-  } else if (!parsed) {
+  } else if (!parsed && !streamWithoutResult) {
     state = "failed";
     error = "Could not parse agy JSON output" + (firstLine(stderr) ? ": " + firstLine(stderr) : "");
+  } else if (streamWithoutResult) {
+    state = "failed";
+    error =
+      "agy stream ended without a result event" +
+      (stream.deltaCount > 0 ? " (reply recovered from " + stream.deltaCount + " text_delta step(s))" : "") +
+      (firstLine(stderr) ? ": " + firstLine(stderr) : "");
   } else if (emptyReply) {
     state = "failed";
     error = "agy returned an empty reply" + (backendError ? ": " + backendError : "");
   }
 
-  return { state, reply, sessionId, usage, error, status };
+  return {
+    state,
+    reply,
+    sessionId,
+    usage,
+    error,
+    status,
+    stream: stream.sawStream,
+    delta_count: stream.deltaCount,
+  };
 }
 
 function killTree(child) {

@@ -8,6 +8,9 @@ export const displayName = "Codex CLI (codex)";
 export const envBinVar = "CODEX_BIN";
 export const binaryName = "codex";
 export const defaultAccess = "full";
+// How this CLI receives the next conversation turn: agy keeps one process and
+// reads stdin NDJSON; codex is one process per turn and resumes by thread id.
+export const chatMode = "resume";
 
 const SEARCH_DIRS = [
   ["home-local-bin", "~/.local/bin"],

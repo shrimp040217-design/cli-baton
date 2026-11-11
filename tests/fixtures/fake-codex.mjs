@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { readConfig, recordInvocation, captureStdinIfRequested, spawnGrandchild, sleep, writeLine } from "./fake-common.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { readConfig, recordInvocation, captureStdinIfRequested, spawnGrandchild, sleep, writeLine, logDirOf } from "./fake-common.mjs";
 
 const cfg = readConfig();
 const argv = process.argv.slice(2);
@@ -29,7 +31,15 @@ if (isResume) {
   }
 }
 
-await captureStdinIfRequested(cfg, argv);
+const promptText = await captureStdinIfRequested(cfg, argv);
+if (promptText) {
+  // One line per turn: multi-turn tests assert the conversation order.
+  try {
+    fs.appendFileSync(path.join(logDirOf(cfg), "stdin.jsonl"), JSON.stringify({ text: promptText.trim(), resume: isResume, session: sessionId }) + "\n");
+  } catch {
+    // ignore
+  }
+}
 
 const emit = (obj) => writeLine(obj);
 const usage = () => ({ input_tokens: 123, cached_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 0 });
@@ -38,6 +48,7 @@ emit({ type: "thread.started", thread_id: sessionId });
 emit({ type: "turn.started" });
 
 if (cfg.mode === "grandchild") spawnGrandchild(cfg);
+if (cfg.turnDelayMs > 0) await sleep(cfg.turnDelayMs);
 if (cfg.mode === "sleep" || cfg.mode === "grandchild") await sleep(cfg.sleepMs);
 
 if (cfg.mode === "fail") {
@@ -69,6 +80,7 @@ if (cfg.mode === "transient-errors") {
   emit({ type: "item.completed", item: { id: "item_0", type: "error", message: "transient warning" } });
 }
 
-const text = cfg.mode === "long" ? "A".repeat(cfg.replyChars) : cfg.text;
+const text =
+  cfg.mode === "long" ? "A".repeat(cfg.replyChars) : cfg.mode === "echo" ? "echo: " + String(promptText || "").trim() : cfg.text;
 emit({ type: "item.completed", item: { id: "item_2", type: "agent_message", text } });
 emit({ type: "turn.completed", usage: usage() });

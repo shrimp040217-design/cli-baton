@@ -8,14 +8,16 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 export const REPO_ROOT = path.resolve(HERE, "..");
 export const SERVER_PATH = path.join(REPO_ROOT, "src", "server.mjs");
+export const VIEWER_PATH = path.join(REPO_ROOT, "src", "viewer.mjs");
 export const FIXTURES_DIR = path.join(HERE, "fixtures");
 export const FAKE_AGY = path.join(FIXTURES_DIR, "fake-agy.mjs");
 export const FAKE_CODEX = path.join(FIXTURES_DIR, "fake-codex.mjs");
+export const FAKE_OSASCRIPT = path.join(FIXTURES_DIR, "fake-osascript.mjs");
 
 export const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "timed_out", "interrupted"]);
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-for (const fixture of [FAKE_AGY, FAKE_CODEX]) {
+for (const fixture of [FAKE_AGY, FAKE_CODEX, FAKE_OSASCRIPT]) {
   try {
     fs.chmodSync(fixture, 0o755);
   } catch {
@@ -52,9 +54,17 @@ export function fakeEnv({
   stderr,
   exitCode,
   usage,
+  silenceMs,
+  chunks,
+  chunkMs,
+  turnDelayMs,
+  halfLineMs,
+  graceS,
   extra = {},
 }) {
-  const env = { ...process.env, CLI_BATON_HOME: home, FAKE_LOG_DIR: logDir, FAKE_MODE: mode };
+  // Tests never pop up Terminal windows: CLI_BATON_VIEWER=0 is the documented
+  // off switch, and individual tests override it to exercise the open path.
+  const env = { ...process.env, CLI_BATON_HOME: home, FAKE_LOG_DIR: logDir, FAKE_MODE: mode, CLI_BATON_VIEWER: "0" };
   if (backend === "agy") {
     env.AGY_BIN = FAKE_AGY;
   } else if (backend === "codex") {
@@ -69,6 +79,12 @@ export function fakeEnv({
   if (stderr !== undefined) env.FAKE_STDERR = String(stderr);
   if (exitCode !== undefined) env.FAKE_EXIT_CODE = String(exitCode);
   if (usage !== undefined) env.FAKE_USAGE = JSON.stringify(usage);
+  if (silenceMs !== undefined) env.FAKE_SILENCE_MS = String(silenceMs);
+  if (chunks !== undefined) env.FAKE_CHUNKS = String(chunks);
+  if (chunkMs !== undefined) env.FAKE_CHUNK_MS = String(chunkMs);
+  if (turnDelayMs !== undefined) env.FAKE_TURN_DELAY_MS = String(turnDelayMs);
+  if (halfLineMs !== undefined) env.FAKE_HALF_LINE_MS = String(halfLineMs);
+  if (graceS !== undefined) env.CLI_BATON_CHAT_GRACE_S = String(graceS);
   return Object.assign(env, extra);
 }
 
@@ -328,11 +344,60 @@ export function readRunDir(runDir) {
     meta: readJsonIfExists(path.join(runDir, "meta.json")),
     result: readJsonIfExists(path.join(runDir, "result.json")),
     supervisor: readJsonIfExists(path.join(runDir, "supervisor.json")),
+    viewer: readJsonIfExists(path.join(runDir, "viewer.json")),
+    viewerLog: read("viewer.log"),
     prompt: read("prompt.txt"),
     stdout: read("stdout.jsonl"),
     stderr: read("stderr.log"),
     reply: read("reply.txt"),
     files: fs.existsSync(runDir) ? fs.readdirSync(runDir) : [],
+  };
+}
+
+/** Build a synthetic run directory (no runner) for viewer tests. */
+export function makeRunDir({ backend = "agy", runId = "a".repeat(24), meta = {}, state = "running" } = {}) {
+  const home = makeHome();
+  const dir = path.join(home.path, backend, "runs", runId);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const body = {
+    run_id: runId,
+    backend,
+    state,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    cwd: "/tmp/cli-baton-viewer-test",
+    model: "test-model",
+    effort: "high",
+    access: "full",
+    child_pid: null,
+    ...meta,
+  };
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(body, null, 2) + "\n");
+  fs.writeFileSync(path.join(dir, "stdout.jsonl"), "");
+  fs.writeFileSync(path.join(dir, "stderr.log"), "");
+  return {
+    home: home.path,
+    runDir: dir,
+    writeMeta(patch = {}, nextState = body.state) {
+      const merged = { ...body, ...patch, state: nextState, updated_at: new Date().toISOString() };
+      fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(merged, null, 2) + "\n");
+      return merged;
+    },
+    writeResult(result) {
+      fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify(result, null, 2) + "\n");
+    },
+    appendStdout(text) {
+      fs.appendFileSync(path.join(dir, "stdout.jsonl"), text);
+    },
+    appendStderr(text) {
+      fs.appendFileSync(path.join(dir, "stderr.log"), text);
+    },
+    writeViewer(info) {
+      fs.writeFileSync(path.join(dir, "viewer.json"), JSON.stringify(info, null, 2) + "\n");
+    },
+    remove() {
+      home.remove();
+    },
   };
 }
 

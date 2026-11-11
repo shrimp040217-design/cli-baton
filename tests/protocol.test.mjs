@@ -30,9 +30,11 @@ import {
 
 const BACKENDS = ["agy", "codex"];
 const TEST_TIMEOUT = 30000;
-const TOOL_LEAVES = ["send", "wait", "status", "cancel", "list_runs", "list_models"];
+// Both backends are conversations, so both expose <prefix>_say.
+const TOOL_LEAVES = ["send", "say", "wait", "status", "cancel", "list_runs", "list_models"];
+const CODEX_TOOL_LEAVES = TOOL_LEAVES;
 const READ_ONLY_TOOLS = ["wait", "status", "list_runs", "list_models"];
-const MUTATING_TOOLS = ["send", "cancel"];
+const MUTATING_TOOLS = ["send", "say", "cancel"];
 
 /**
  * Per-test sandbox: isolated temp CLI_BATON_HOME, cwd and FAKE_LOG_DIR.
@@ -99,7 +101,8 @@ async function listTools(client) {
 }
 
 function assertToolCatalog(tools, prefix) {
-  const expectedNames = TOOL_LEAVES.map((leaf) => prefix + "_" + leaf);
+  const leaves = prefix === "agy" ? TOOL_LEAVES : CODEX_TOOL_LEAVES;
+  const expectedNames = leaves.map((leaf) => prefix + "_" + leaf);
   const names = tools.map((tool) => tool.name);
 
   assert.equal(tools.length, expectedNames.length, "expected exactly " + expectedNames.length + " " + prefix + "_* tools, got: " + names.join(", "));
@@ -123,7 +126,9 @@ function assertToolCatalog(tools, prefix) {
     assert.equal(byName.get(prefix + "_" + leaf).annotations.readOnlyHint, true, prefix + "_" + leaf + ": readOnlyHint must be true");
   }
   for (const leaf of MUTATING_TOOLS) {
-    assert.equal(byName.get(prefix + "_" + leaf).annotations.readOnlyHint, false, prefix + "_" + leaf + ": readOnlyHint must be false");
+    const tool = byName.get(prefix + "_" + leaf);
+    if (!tool) continue; // a backend may expose fewer tools than the shared list
+    assert.equal(tool.annotations.readOnlyHint, false, prefix + "_" + leaf + ": readOnlyHint must be false");
   }
   assert.equal(byName.get(prefix + "_cancel").annotations.destructiveHint, true, prefix + "_cancel: destructiveHint must be true");
 }
@@ -240,20 +245,20 @@ test("invalid JSON line returns -32700 with id null and the server keeps serving
 
   assert.deepEqual(await client.request("ping"), {}, "server must answer ping after a parse error");
   const tools = await client.request("tools/list", {});
-  assert.ok(Array.isArray(tools.tools) && tools.tools.length === 6, "server must keep serving tools/list after a parse error");
+  assert.ok(Array.isArray(tools.tools) && tools.tools.length === 7, "server must keep serving tools/list after a parse error");
 });
 
 /* ------------------------------------------------------------------ */
 /* 4. tools/list                                                      */
 /* ------------------------------------------------------------------ */
 
-test("tools/list on the agy server exposes exactly the six agy_* tools with annotations", { timeout: TEST_TIMEOUT }, async (t) => {
+test("tools/list on the agy server exposes exactly the expected agy_* tools with annotations", { timeout: TEST_TIMEOUT }, async (t) => {
   const { client } = await startClient(t, "agy");
   const tools = await listTools(client);
   assertToolCatalog(tools, "agy");
 });
 
-test("tools/list on the codex server exposes exactly the six codex_* tools with annotations", { timeout: TEST_TIMEOUT }, async (t) => {
+test("tools/list on the codex server exposes exactly the expected codex_* tools with annotations", { timeout: TEST_TIMEOUT }, async (t) => {
   const { client } = await startClient(t, "codex");
   const tools = await listTools(client);
   assertToolCatalog(tools, "codex");

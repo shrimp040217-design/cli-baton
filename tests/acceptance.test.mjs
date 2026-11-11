@@ -61,6 +61,9 @@ test("successful send/wait exposes the documented field set for both backends", 
       assert.equal(final.state, "completed");
       assert.equal(final.backend, backend);
       assert.equal(final.reply, backend.toUpperCase() + "_OK");
+      assert.equal(final.chat, true, "both backends are conversations now");
+      assert.equal(final.turns.length, 1, "the prompt is the first turn");
+      assert.equal(final.turns[0].user_text, "hello " + backend);
       assert.equal(final.session_id, "fake-session-0001");
       assert.equal(final.exit_code, 0);
       assert.equal(final.error, null);
@@ -169,7 +172,14 @@ test("prompts starting with a dash are passed safely for both backends", async (
     const { final } = await sendWait(client, { prefix: "agy", message: "- reply with DASH_OK", cwd: makeCwd().path, waitTimeoutMs: 20000 });
     assert.equal(final.state, "completed");
     const argv = readArgv(logDir).argv;
-    assert.equal(argv[argv.indexOf("-p") + 1], "- reply with DASH_OK");
+    assert.ok(!argv.some((argument) => argument.includes("DASH_OK")), "agy prompts go through stdin now");
+    assert.ok(argv.includes("-p="), "-p= must stay a single empty-value token");
+    const messages = fs
+      .readFileSync(path.join(logDir, "stdin.jsonl"), "utf8")
+      .split(String.fromCharCode(10))
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(messages[0].message.content[0].text, "- reply with DASH_OK");
   });
   await withClient("codex", {}, async ({ client, logDir }) => {
     clearArgv(logDir);

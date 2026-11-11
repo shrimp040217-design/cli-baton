@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 import * as runs from "./runs.mjs";
+import * as chat from "./chat.mjs";
 import { getBackend } from "./backends/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -63,6 +64,16 @@ function buildDefinition(backendName) {
             default: 3600,
             description: "Runner-side timeout in seconds (kills the CLI process group).",
           },
+          stall_s: {
+            type: "integer",
+            minimum: 1,
+            maximum: 86400,
+            description:
+              "Optional stall threshold in seconds. Stored on the run: " +
+              prefix +
+              "wait returns immediately with stalled:true when the run is still running but has produced no output for longer than this. " +
+              "The process is never killed by stall detection.",
+          },
         },
         required: ["message", "cwd"],
         additionalProperties: false,
@@ -70,14 +81,43 @@ function buildDefinition(backendName) {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     {
+      suffix: "say",
+      description:
+        "Append another message to a running conversation. The message is queued in the run's inbox and executed after the turn that is currently running (agy: written to the live process; codex: a new `exec resume` turn). agy conversations allow at most CLI_BATON_AGY_MAX_TURNS turns (default 2); at the cap this tool fails with error \"max_turns_reached\" and nothing is queued. The reply arrives as a new turn (visible in " +
+        prefix +
+        "wait / " +
+        prefix +
+        "status as turns[]). Fails clearly when the run has already finished.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string", description: "Run id returned by " + prefix + "send." },
+          text: { type: "string", description: "Message to add to the conversation." },
+        },
+        required: ["run_id", "text"],
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    {
       suffix: "wait",
       description:
-        "Wait for a run to reach a terminal state (polls every 500ms). Returns the current state plus timed_out:true when the wait deadline elapses.",
+        "Wait for a run to reach a terminal state (polls every 500ms). Returns the current state plus timed_out:true when the wait deadline elapses. " +
+        "Includes last_output_at / stdout_bytes / event_count / last_event / idle_s, and (conversation mode) turns[] plus grace_until / grace_remaining_s. " +
+        "When a stall threshold applies and idle_s exceeds it while the run is still running, returns immediately with stalled:true (the process is not killed). " +
+        "A conversation keeps running through its grace window, so a wait can block across turns and returns once the run reaches a terminal state (or a stall / wait deadline fires).",
       inputSchema: {
         type: "object",
         properties: {
           run_id: { type: "string", description: "Run id returned by " + prefix + "send." },
           timeout_s: { type: "integer", minimum: 1, maximum: 540, default: 240, description: "Maximum time to wait." },
+          stall_s: {
+            type: "integer",
+            minimum: 1,
+            maximum: 86400,
+            description:
+              "Stall threshold in seconds. Defaults to the value stored by " + prefix + "send. When the run is running and idle_s > stall_s, " + prefix + "wait returns immediately with stalled:true.",
+          },
         },
         required: ["run_id"],
         additionalProperties: false,
@@ -86,7 +126,8 @@ function buildDefinition(backendName) {
     },
     {
       suffix: "status",
-      description: "Return a run's current state without waiting, including the most recent raw event lines.",
+      description:
+        "Return a run's current state without waiting, including the most recent raw event lines, the progress fields last_output_at / stdout_bytes / event_count / last_event / idle_s, and (conversation runs, both backends) the turns[] array plus inflight / grace_until / grace_remaining_s.",
       inputSchema: {
         type: "object",
         properties: {
@@ -243,6 +284,7 @@ async function handleSend({ backendName, backend, args, env }) {
   const effort = enumArg(args, "effort", EFFORT_VALUES);
   const access = enumArg(args, "access", ACCESS_VALUES, { defaultValue: backend.defaultAccess });
   const timeoutS = integerArg(args, "timeout_s", { min: 10, max: 86400, defaultValue: 3600 });
+  const stallS = integerArg(args, "stall_s", { min: 1, max: 86400 });
 
   const root = runs.resolveRoot(env);
   const active = runs.findActiveRunBySession({ root, backend: backendName, sessionId });
@@ -283,6 +325,8 @@ async function handleSend({ backendName, backend, args, env }) {
       effort: effort || null,
       access,
       timeout_s: timeoutS,
+      stall_s: stallS === undefined ? null : stallS,
+      chat: true,
       cli_path: located.path,
       cli_source: located.source,
       argv: argvTemplate,
@@ -336,14 +380,72 @@ async function handleSend({ backendName, backend, args, env }) {
   };
 }
 
+async function handleSay({ backendName, args, env }) {
+  const runId = runIdArg(args);
+  const text = requireString(args, "text", { nonEmpty: true, maxLength: 100000 });
+  const root = runs.resolveRoot(env);
+  let snapshot = runs.getRunSnapshot({ root, backend: backendName, runId, includeReply: false });
+  if (!snapshot) throw new ToolInputError("Run not found: " + runId);
+  if (snapshot.chat !== true) {
+    throw new ToolInputError(
+      backendName + " runs are not conversations; start a new run with " + backendName + "_send instead.",
+    );
+  }
+  if (runs.TERMINAL_STATES.has(snapshot.state)) {
+    throw new ToolInputError(
+      "Run " + runId + " already finished (" + snapshot.state + "); start a new run with " + backendName + "_send instead.",
+    );
+  }
+  // At the cap the conversation is over for good, whether or not the last turn
+  // already closed the CLI: callers branch on this exact token.
+  if (snapshot.max_turns_reached === true) {
+    throw new ToolInputError("max_turns_reached");
+  }
+  if (snapshot.stdin_closed === true) {
+    throw new ToolInputError(
+      "Run " + runId + " is closing its conversation (stdin already closed); start a new run with " + backendName + "_send instead.",
+    );
+  }
+  let entry;
+  try {
+    entry = chat.appendInboxLine(snapshot.run_dir, { text, source: "caller" });
+  } catch (error) {
+    throw new ToolInputError("Could not queue the message: " + String((error && error.message) || error));
+  }
+  snapshot = runs.getRunSnapshot({ root, backend: backendName, runId, includeReply: false });
+  const payload = runs.formatToolPayload(snapshot);
+  payload.say = { queued: true, at: entry.at, source: entry.source, inflight: payload.inflight === true };
+  return payload;
+}
+
 async function handleWait({ backendName, args, env }) {
   const runId = runIdArg(args);
   const timeoutS = integerArg(args, "timeout_s", { min: 1, max: 540, defaultValue: 240 });
+  const explicitStallS = integerArg(args, "stall_s", { min: 1, max: 86400 });
   const root = runs.resolveRoot(env);
   const deadline = Date.now() + timeoutS * 1000;
   let snapshot = runs.getRunSnapshot({ root, backend: backendName, runId, includeReply: true });
   if (!snapshot) throw new ToolInputError("Run not found: " + runId);
-  while (!runs.TERMINAL_STATES.has(snapshot.state)) {
+  const stallS = explicitStallS !== undefined ? explicitStallS : snapshot.stall_s || null;
+
+  // Stall detection never kills the run: it only makes a wait return early with
+  // stalled:true so the caller can decide (status again, cancel, keep waiting).
+  const stalledPayload = () => {
+    const payload = runs.formatToolPayload(snapshot);
+    payload.stalled = true;
+    payload.stall_s = stallS;
+    payload.idle_s = snapshot.idle_s;
+    return payload;
+  };
+
+  while (true) {
+    if (runs.TERMINAL_STATES.has(snapshot.state)) return runs.formatToolPayload(snapshot);
+    // A chat run idling inside its grace window is waiting for user input on
+    // purpose; calling that a stall would be a false positive.
+    const waitingForInput = snapshot.grace_remaining_s !== null && snapshot.inflight !== true;
+    if (stallS && snapshot.state === "running" && !waitingForInput && Number.isFinite(snapshot.idle_s) && snapshot.idle_s > stallS) {
+      return stalledPayload();
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       const payload = runs.formatToolPayload(snapshot);
@@ -354,7 +456,6 @@ async function handleWait({ backendName, args, env }) {
     snapshot = runs.getRunSnapshot({ root, backend: backendName, runId, includeReply: true });
     if (!snapshot) throw new ToolInputError("Run not found: " + runId);
   }
-  return runs.formatToolPayload(snapshot);
 }
 
 async function handleStatus({ backendName, args, env }) {
@@ -397,6 +498,7 @@ async function handleListModels({ backendName, backend, env }) {
 
 const HANDLERS = {
   send: handleSend,
+  say: handleSay,
   wait: handleWait,
   status: handleStatus,
   cancel: handleCancel,
@@ -410,7 +512,8 @@ export async function callTool({ backendName, name, args, env = process.env }) {
   const prefix = backendName + "_";
   const suffix = typeof name === "string" && name.startsWith(prefix) ? name.slice(prefix.length) : null;
   const handler = suffix ? HANDLERS[suffix] : null;
-  if (!handler) {
+  const advertised = suffix ? buildDefinition(backendName).some((definition) => definition.suffix === suffix) : false;
+  if (!handler || !advertised) {
     return toolErrorResult("Unknown tool for the " + backendName + " backend: " + String(name));
   }
   let parsed;

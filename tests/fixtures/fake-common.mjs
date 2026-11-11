@@ -20,6 +20,15 @@ export function readConfig() {
     stderr: env.FAKE_STDERR || "",
     sleepMs: Number(env.FAKE_SLEEP_MS || 60000),
     replyChars: Number(env.FAKE_REPLY_CHARS || 150000),
+    // "silent": how long the fake stays quiet after a few output lines.
+    silenceMs: Number(env.FAKE_SILENCE_MS || 60000),
+    // "chatty": how many events to emit and how far apart.
+    chunks: Number(env.FAKE_CHUNKS || 60),
+    chunkMs: Number(env.FAKE_CHUNK_MS || 20),
+    // conversation mode: how long one turn takes (queueing / grace tests).
+    turnDelayMs: Number(env.FAKE_TURN_DELAY_MS || 0),
+    // "half-line": how long one stdout line stays unterminated.
+    halfLineMs: Number(env.FAKE_HALF_LINE_MS || 1500),
     exitCode: Number(env.FAKE_EXIT_CODE || 3),
     usage,
   };
