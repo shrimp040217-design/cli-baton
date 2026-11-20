@@ -5,7 +5,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { listTools, callTool, toolErrorResult } from "./tools.mjs";
-import { getBackend } from "./backends/index.mjs";
+import { BACKEND_NAMES, getBackend } from "./backends/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 let VERSION = "0.0.0";
@@ -25,17 +25,18 @@ function parseBackendArg(argv) {
 }
 
 const backendName = parseBackendArg(process.argv.slice(2));
+const expectedBackends = BACKEND_NAMES.join("|");
 if (backendName === undefined) {
-  process.stderr.write("[cli-baton] missing required argument: --backend <agy|codex>\n");
+  process.stderr.write("[cli-baton] missing required argument: --backend <" + expectedBackends + ">\n");
   process.exit(1);
 }
 if (!backendName) {
-  process.stderr.write("[cli-baton] --backend requires a value (agy or codex)\n");
+  process.stderr.write("[cli-baton] --backend requires a value (" + BACKEND_NAMES.join(", ") + ")\n");
   process.exit(1);
 }
 const backend = getBackend(backendName);
 if (!backend) {
-  process.stderr.write("[cli-baton] unknown backend: " + backendName + " (expected agy or codex)\n");
+  process.stderr.write("[cli-baton] unknown backend: " + backendName + " (expected " + BACKEND_NAMES.join(", ") + ")\n");
   process.exit(1);
 }
 
@@ -67,6 +68,9 @@ function respondError(id, code, message, data) {
   writeMessage({ jsonrpc: "2.0", id, error });
 }
 
+let clientName = null;
+const activeAborts = new Map();
+
 async function handleMessage(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     respondError(null, -32600, "Invalid Request");
@@ -79,16 +83,21 @@ async function handleMessage(message) {
     if (hasId) respondError(id, -32600, "Invalid Request: method must be a string");
     return;
   }
+  const params = message.params;
   if (!hasId) {
     // Notification (e.g. notifications/initialized, notifications/cancelled):
     // JSON-RPC never sends a response for these.
+    if (method === "notifications/cancelled" && params && params.requestId !== undefined) {
+      const controller = activeAborts.get(params.requestId);
+      if (controller) controller.abort();
+    }
     return;
   }
 
-  const params = message.params;
-
   if (method === "initialize") {
     const requested = params && typeof params.protocolVersion === "string" && params.protocolVersion.trim();
+    clientName =
+      params && params.clientInfo && typeof params.clientInfo.name === "string" ? params.clientInfo.name : null;
     respond(id, {
       protocolVersion: requested || "2025-06-18",
       capabilities: { tools: { listChanged: false } },
@@ -103,7 +112,7 @@ async function handleMessage(message) {
   }
 
   if (method === "tools/list") {
-    respond(id, { tools: listTools(backendName) });
+    respond(id, { tools: listTools(backendName, { clientName }) });
     return;
   }
 
@@ -114,12 +123,36 @@ async function handleMessage(message) {
       respond(id, toolErrorResult("Invalid tools/call params: missing tool name"));
       return;
     }
+    const progressToken = params && params._meta ? params._meta.progressToken : undefined;
+    const progress =
+      progressToken === undefined
+        ? undefined
+        : (done, note) =>
+            writeMessage({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken, progress: done, message: note },
+            });
+    const abort = new AbortController();
+    activeAborts.set(id, abort);
     try {
-      const result = await callTool({ backendName, name: toolName, args: toolArgs, env: process.env });
-      respond(id, result);
+      const result = await callTool({
+        backendName,
+        name: toolName,
+        args: toolArgs,
+        env: process.env,
+        clientName,
+        progress,
+        signal: abort.signal,
+      });
+      if (!abort.signal.aborted) respond(id, result);
     } catch (error) {
       log("tools/call " + toolName + " crashed: " + String((error && error.message) || error));
-      respond(id, toolErrorResult("Internal error: " + String((error && error.message) || error)));
+      if (!abort.signal.aborted) {
+        respond(id, toolErrorResult("Internal error: " + String((error && error.message) || error)));
+      }
+    } finally {
+      activeAborts.delete(id);
     }
     return;
   }

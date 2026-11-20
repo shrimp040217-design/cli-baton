@@ -1,10 +1,13 @@
 {
   "name": "cli-baton",
-  "version": "0.1.0",
-  "description": "Zero-dependency MCP stdio server that hands tasks to local agy / codex CLIs and returns results asynchronously",
+  "version": "0.2.0",
+  "description": "Zero-dependency MCP stdio server that hands tasks to local agy / codex / claude CLIs and returns results asynchronously",
   "type": "module",
   "private": true,
   "license": "MIT",
+  "bin": {
+    "cli-baton": "src/cli.mjs"
+  },
   "engines": {
     "node": ">=18"
   },

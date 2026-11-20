@@ -19,7 +19,7 @@ export const MAX_GRACE_S = 3600;
 export const INBOX_POLL_MS = 200;
 export const CHAT_SOURCES = ["caller", "window"];
 
-export const DEFAULT_MAX_TURNS = { agy: 2, codex: Infinity };
+export const DEFAULT_MAX_TURNS = { agy: 2, codex: Infinity, claude: Infinity };
 export const AGY_MAX_TURNS_ENV = "CLI_BATON_AGY_MAX_TURNS";
 
 /**

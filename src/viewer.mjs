@@ -88,13 +88,10 @@ export function formatTokens(usage) {
   if (input !== null) parts.push("in=" + input);
   if (output !== null) parts.push("out=" + output);
   if (total !== null) parts.push("total=" + total);
-  for (const [label, key] of [
-    ["cached", "cached_input_tokens"],
-    ["reasoning", "reasoning_output_tokens"],
-  ]) {
-    const value = num(usage[key]);
-    if (value !== null && value !== 0) parts.push(label + "=" + value);
-  }
+  const cached = num(usage.cached_input_tokens) ?? num(usage.cache_read_input_tokens);
+  if (cached !== null && cached !== 0) parts.push("cached=" + cached);
+  const reasoning = num(usage.reasoning_output_tokens) ?? num(usage.thinking_tokens);
+  if (reasoning !== null && reasoning !== 0) parts.push("reasoning=" + reasoning);
   return parts.length > 0 ? parts.join(" ") : null;
 }
 
@@ -139,6 +136,7 @@ export function toolNameOf(step) {
 export function createRenderer({ color = false, now = () => new Date(), timestamp = true } = {}) {
   const stepSignatures = new Map();
   let atLineStart = true;
+  let sawClaudeDeltas = false;
 
   const paint = (name, text) => (color && ANSI[name] ? ANSI[name] + text + ANSI.reset : text);
 
@@ -244,6 +242,89 @@ export function createRenderer({ color = false, now = () => new Date(), timestam
     return marker(String(event), summarizeValue(value, 200));
   }
 
+  function claudeEvent(value) {
+    const type = value.type;
+    if (type === "system") {
+      if (value.subtype === "init") {
+        const parts = [];
+        if (value.model) parts.push("model=" + value.model);
+        if (value.permissionMode) parts.push("permission=" + value.permissionMode);
+        if (value.session_id) parts.push("session=" + shortId(value.session_id));
+        return marker("init", parts.join(" · "));
+      }
+      if (value.subtype === "status" && value.status) {
+        return marker("status", String(value.status), "dim");
+      }
+      return marker("system", value.subtype ? String(value.subtype) : summarizeValue(value, 180));
+    }
+    if (type === "stream_event") {
+      const inner = value.event && typeof value.event === "object" ? value.event : null;
+      if (!inner) return "";
+      if (inner.type === "message_start") {
+        sawClaudeDeltas = false;
+        return "";
+      }
+      if (inner.type === "content_block_start" && inner.content_block && typeof inner.content_block === "object") {
+        if (inner.content_block.type === "tool_use") {
+          return marker("tool", summarizeValue(inner.content_block.name || "tool_use", 200), "yellow");
+        }
+        if (inner.content_block.type === "thinking") {
+          return marker("thinking", "started", "dim");
+        }
+        return "";
+      }
+      if (inner.type === "content_block_delta" && inner.delta && typeof inner.delta === "object") {
+        if (inner.delta.type === "text_delta" && typeof inner.delta.text === "string" && inner.delta.text) {
+          sawClaudeDeltas = true;
+          return prose(inner.delta.text);
+        }
+        return "";
+      }
+      return "";
+    }
+    if (type === "assistant") {
+      if (sawClaudeDeltas) return "";
+      const content = value.message && Array.isArray(value.message.content) ? value.message.content : [];
+      let out = "";
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        if (block.type === "tool_use") {
+          out += marker("tool", summarizeValue(block.name || "tool_use", 200), "yellow");
+        } else if (block.type === "text" && typeof block.text === "string" && block.text) {
+          const prefix = atLineStart ? "" : "\n";
+          out += prefix + prose(block.text.endsWith("\n") ? block.text : block.text + "\n");
+        }
+      }
+      return out;
+    }
+    if (type === "user" || type === "rate_limit_event") {
+      return "";
+    }
+    if (type === "result") {
+      sawClaudeDeltas = false;
+      const isError = value.is_error === true || (typeof value.subtype === "string" && value.subtype !== "success");
+      const parts = [];
+      parts.push("status=" + (value.subtype || (isError ? "error" : "success")));
+      if (typeof value.duration_ms === "number") parts.push("用时=" + formatSeconds(value.duration_ms / 1000));
+      const tokens = formatTokens(value.usage);
+      if (tokens) parts.push("tokens " + tokens);
+      if (typeof value.num_turns === "number") parts.push("turns=" + value.num_turns);
+      if (typeof value.total_cost_usd === "number" && Number.isFinite(value.total_cost_usd)) {
+        parts.push("cost=$" + value.total_cost_usd.toFixed(4));
+      }
+      if (isError) {
+        const detail =
+          (Array.isArray(value.errors) && value.errors[0]) ||
+          value.error ||
+          (typeof value.result === "string" && value.result) ||
+          "error";
+        parts.push("error=" + summarizeValue(detail, 120));
+      }
+      return marker("result", parts.join(" · "), isError ? "red" : "green");
+    }
+    return null;
+  }
+
   function codexEvent(value) {
     const type = value.type;
     if (type === "thread.started") return marker("session", shortId(value.thread_id));
@@ -297,7 +378,11 @@ export function createRenderer({ color = false, now = () => new Date(), timestam
         return marker("raw", summarizeValue(raw.trim(), 240));
       }
       if (typeof value.event === "string") return agyEvent(value);
-      if (typeof value.type === "string") return codexEvent(value);
+      if (typeof value.type === "string") {
+        const claudeRendered = claudeEvent(value);
+        if (claudeRendered !== null) return claudeRendered;
+        return codexEvent(value);
+      }
       return marker("json", summarizeValue(value, 200));
     },
     /** Render one raw line from stderr.log. */

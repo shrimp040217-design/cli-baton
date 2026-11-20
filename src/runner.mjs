@@ -84,11 +84,12 @@ function log(message) {
 
 // GUI-launched MCP clients often omit Homebrew from PATH, and an npm-installed
 // CLI starts with `#!/usr/bin/env node`: keep this Node and the CLI's folder reachable.
-function childEnv(cliPath) {
+function childEnv(cliPath, backend) {
+  const base = backend && typeof backend.sanitizeEnv === "function" ? backend.sanitizeEnv(process.env) : { ...process.env };
   const entries = [path.dirname(process.execPath)];
   if (path.isAbsolute(String(cliPath))) entries.push(path.dirname(cliPath));
-  entries.push(...String(process.env.PATH || "").split(path.delimiter).filter(Boolean));
-  return { ...process.env, PATH: [...new Set(entries)].join(path.delimiter) };
+  entries.push(...String(base.PATH || "").split(path.delimiter).filter(Boolean));
+  return { ...base, PATH: [...new Set(entries)].join(path.delimiter) };
 }
 
 function quoteForCmd(value) {
@@ -265,11 +266,21 @@ async function main() {
         progress.event_count += 1;
         progress.last_event =
           typeof parsed.event === "string" ? parsed.event : typeof parsed.type === "string" ? parsed.type : "json";
-        if (parsed.event === "result" && onTurnResult) {
-          try {
-            onTurnResult(parsed.result && typeof parsed.result === "object" ? parsed.result : {});
-          } catch {
-            // turn bookkeeping must never break the run
+        if (onTurnResult) {
+          const turnResult =
+            typeof backend.extractTurnResult === "function"
+              ? backend.extractTurnResult(parsed)
+              : parsed.event === "result"
+                ? parsed.result && typeof parsed.result === "object"
+                  ? parsed.result
+                  : {}
+                : null;
+          if (turnResult) {
+            try {
+              onTurnResult(turnResult);
+            } catch {
+              // turn bookkeeping must never break the run
+            }
           }
         }
       } else {
@@ -430,15 +441,24 @@ async function main() {
     }
   };
 
-  // agy ends a turn with an `event:"result"` line on the live process; codex
-  // ends one when its per-turn process exits (see onAttemptExit).
+  // stdin-mode backends (agy, claude) end a turn with a result event on the
+  // live process; resume-mode backends (codex) end one when the per-turn process exits.
   if (chatEnabled && chatMode === "stdin") {
     onTurnResult = (result) => {
+      if (result && typeof result.sessionId === "string" && result.sessionId) {
+        threadId = result.sessionId;
+      }
       session.completeTurn({
-        reply: typeof result.response === "string" ? result.response : "",
+        reply: typeof result.reply === "string" ? result.reply : typeof result.response === "string" ? result.response : "",
         status: typeof result.status === "string" ? result.status : null,
-        duration_s: typeof result.duration_seconds === "number" ? result.duration_seconds : null,
+        duration_s:
+          typeof result.duration_s === "number"
+            ? result.duration_s
+            : typeof result.duration_seconds === "number"
+              ? result.duration_seconds
+              : null,
         usage: result.usage && typeof result.usage === "object" ? result.usage : null,
+        error: typeof result.error === "string" ? result.error : null,
       });
     };
   }
@@ -542,7 +562,7 @@ async function main() {
     try {
       proc = spawnCli(meta.cli_path || backend.binaryName, invocation.args, {
         cwd: meta.cwd,
-        env: childEnv(meta.cli_path || backend.binaryName),
+        env: childEnv(meta.cli_path || backend.binaryName, backend),
         detached: process.platform !== "win32",
         stdio: [invocation.stdin === "ignore" ? "ignore" : "pipe", "pipe", "pipe"],
         windowsHide: true,
@@ -567,7 +587,11 @@ async function main() {
     if (!chatEnabled || settled) return;
     if (chatMode === "stdin") {
       try {
-        child.stdin.write(chat.buildUserMessage(entry.text));
+        const line =
+          typeof backend.buildUserMessage === "function"
+            ? backend.buildUserMessage(entry.text)
+            : chat.buildUserMessage(entry.text);
+        child.stdin.write(line);
       } catch {
         // EPIPE: the process is gone, its exit handler takes over
       }

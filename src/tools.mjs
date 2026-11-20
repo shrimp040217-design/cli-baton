@@ -9,11 +9,32 @@ import { getBackend } from "./backends/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER_PATH = path.join(HERE, "runner.mjs");
+const CLI_PATH = path.join(HERE, "cli.mjs");
 
 export const EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"];
 export const ACCESS_VALUES = ["read-only", "full"];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function isCodexClient(clientName) {
+  return /codex/i.test(String(clientName || ""));
+}
+
+export function isClaudeClient(clientName) {
+  return /claude/i.test(String(clientName || ""));
+}
+
+function shellQuote(value) {
+  return '"' + String(value).replace(/(["\\$`])/g, "\\$1") + '"';
+}
+
+export function buildWaitCommand({ backendName, runId, root, env = process.env } = {}) {
+  const parts = [shellQuote(process.execPath), shellQuote(CLI_PATH), "wait", "--backend", backendName, runId];
+  if (env && env.CLI_BATON_HOME && String(env.CLI_BATON_HOME).trim()) {
+    parts.push("--home", shellQuote(root || runs.resolveRoot(env)));
+  }
+  return parts.join(" ");
+}
 
 export class ToolInputError extends Error {
   constructor(message) {
@@ -26,22 +47,51 @@ function accessDescription(backendName) {
   if (backendName === "agy") {
     return "Access mode. Default: full (passes --dangerously-skip-permissions). read-only passes --mode plan and does not skip permission prompts.";
   }
+  if (backendName === "claude") {
+    return "Access mode. Default: full (passes --dangerously-skip-permissions). read-only passes --permission-mode plan.";
+  }
   return 'Access mode. Default: full (passes --dangerously-bypass-approvals-and-sandbox). read-only passes -c sandbox_mode="read-only" -c approval_policy="never" for both new and resumed sessions.';
 }
 
-function buildDefinition(backendName) {
+function sessionIdDescription(backendName) {
+  if (backendName === "agy") {
+    return "Resume an existing conversation with --conversation <session_id>. Never uses -c/--continue.";
+  }
+  if (backendName === "claude") {
+    return "Resume an existing conversation with --resume <session_id>. Never uses -c/--continue.";
+  }
+  return "Resume an existing codex session: codex exec resume <session_id>.";
+}
+
+function listModelsDescription(backendName) {
+  if (backendName === "agy") {
+    return "List models known to the agy CLI by parsing 'agy models'. Returns a clear error (never a fabricated list) if the CLI cannot provide one.";
+  }
+  if (backendName === "claude") {
+    return "List model aliases advertised by 'claude --help'. Returns a clear error (never a fabricated list) if the CLI cannot provide one.";
+  }
+  return "List models known to the codex CLI by parsing 'codex debug models'. Returns a clear error (never a fabricated list) if the CLI cannot provide one.";
+}
+
+function buildDefinition(backendName, { clientName = null } = {}) {
   const prefix = backendName + "_";
+  const codexClient = isCodexClient(clientName);
+  const waitDefaultS = codexClient ? 1800 : 240;
   return [
     {
       suffix: "send",
       description:
         "Send a task to the " +
         backendName +
-        " CLI. Returns immediately with run_id/state/run_dir; use " +
-        prefix +
-        "wait or " +
-        prefix +
-        "status to collect the result. access defaults to full for both backends.",
+        " CLI. Returns immediately with run_id/state/run_dir" +
+        (codexClient
+          ? "; call " + prefix + "wait (supports long timeout_s up to 3600) to collect the result."
+          : " plus wait_command and hint. If your client wakes you when a background shell command exits (Claude Code: Bash with run_in_background: true; Antigravity: run_command with WaitMsBeforeAsync: 500), run wait_command in the background instead of polling " +
+            prefix +
+            "wait or " +
+            prefix +
+            "status.") +
+        " access defaults to full for all backends.",
       inputSchema: {
         type: "object",
         properties: {
@@ -49,10 +99,7 @@ function buildDefinition(backendName) {
           cwd: { type: "string", description: "Absolute path to an existing directory; the CLI runs there." },
           session_id: {
             type: "string",
-            description:
-              backendName === "agy"
-                ? "Resume an existing conversation with --conversation <session_id>. Never uses -c/--continue."
-                : "Resume an existing codex session: codex exec resume <session_id>.",
+            description: sessionIdDescription(backendName),
           },
           model: { type: "string", description: "Model name (default: CLI default)." },
           effort: { type: "string", enum: EFFORT_VALUES, description: "Reasoning effort." },
@@ -71,7 +118,7 @@ function buildDefinition(backendName) {
             description:
               "Optional stall threshold in seconds. Stored on the run: " +
               prefix +
-              "wait returns immediately with stalled:true when the run is still running but has produced no output for longer than this. " +
+              "wait (and wait_command) returns immediately with stalled:true when the run is still running but has produced no output for longer than this. " +
               "The process is never killed by stall detection.",
           },
         },
@@ -83,7 +130,7 @@ function buildDefinition(backendName) {
     {
       suffix: "say",
       description:
-        "Append another message to a running conversation. The message is queued in the run's inbox and executed after the turn that is currently running (agy: written to the live process; codex: a new `exec resume` turn). agy conversations allow at most CLI_BATON_AGY_MAX_TURNS turns (default 2); at the cap this tool fails with error \"max_turns_reached\" and nothing is queued. The reply arrives as a new turn (visible in " +
+        "Append another message to a running conversation. The message is queued in the run's inbox and executed after the turn that is currently running (agy/claude: written to the live process stdin; codex: a new `exec resume` turn). agy conversations allow at most CLI_BATON_AGY_MAX_TURNS turns (default 2); at the cap this tool fails with error \"max_turns_reached\" and nothing is queued. The reply arrives as a new turn (visible in " +
         prefix +
         "wait / " +
         prefix +
@@ -102,7 +149,13 @@ function buildDefinition(backendName) {
     {
       suffix: "wait",
       description:
-        "Wait for a run to reach a terminal state (polls every 500ms). Returns the current state plus timed_out:true when the wait deadline elapses. " +
+        "Wait for a run to reach a terminal state (polls every 500ms). " +
+        (codexClient
+          ? "Supports long timeout_s up to 3600s and emits MCP progress notifications when requested. "
+          : "Prefer running wait_command from " +
+            prefix +
+            "send in the background if your client wakes you on exit (costs no turns and never times out). ") +
+        "Returns the current state plus timed_out:true when the wait deadline elapses. " +
         "Includes last_output_at / stdout_bytes / event_count / last_event / idle_s, and (conversation mode) turns[] plus grace_until / grace_remaining_s. " +
         "When a stall threshold applies and idle_s exceeds it while the run is still running, returns immediately with stalled:true (the process is not killed). " +
         "A conversation keeps running through its grace window, so a wait can block across turns and returns once the run reaches a terminal state (or a stall / wait deadline fires).",
@@ -110,7 +163,13 @@ function buildDefinition(backendName) {
         type: "object",
         properties: {
           run_id: { type: "string", description: "Run id returned by " + prefix + "send." },
-          timeout_s: { type: "integer", minimum: 1, maximum: 540, default: 240, description: "Maximum time to wait." },
+          timeout_s: {
+            type: "integer",
+            minimum: 1,
+            maximum: 3600,
+            default: waitDefaultS,
+            description: "Maximum time to wait in seconds.",
+          },
           stall_s: {
             type: "integer",
             minimum: 1,
@@ -127,7 +186,7 @@ function buildDefinition(backendName) {
     {
       suffix: "status",
       description:
-        "Return a run's current state without waiting, including the most recent raw event lines, the progress fields last_output_at / stdout_bytes / event_count / last_event / idle_s, and (conversation runs, both backends) the turns[] array plus inflight / grace_until / grace_remaining_s.",
+        "Return a run's current state without waiting, including the most recent raw event lines, the progress fields last_output_at / stdout_bytes / event_count / last_event / idle_s, and (conversation runs, all backends) the turns[] array plus inflight / grace_until / grace_remaining_s.",
       inputSchema: {
         type: "object",
         properties: {
@@ -176,20 +235,17 @@ function buildDefinition(backendName) {
     },
     {
       suffix: "list_models",
-      description:
-        backendName === "agy"
-          ? "List models known to the agy CLI by parsing 'agy models'. Returns a clear error (never a fabricated list) if the CLI cannot provide one."
-          : "List models known to the codex CLI by parsing 'codex debug models'. Returns a clear error (never a fabricated list) if the CLI cannot provide one.",
+      description: listModelsDescription(backendName),
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
   ];
 }
 
-export function listTools(backendName) {
+export function listTools(backendName, { clientName = null } = {}) {
   const backend = getBackend(backendName);
   if (!backend) throw new Error("Unknown backend: " + backendName);
-  return buildDefinition(backendName).map((definition) => ({
+  return buildDefinition(backendName, { clientName }).map((definition) => ({
     name: backendName + "_" + definition.suffix,
     description: definition.description,
     inputSchema: definition.inputSchema,
@@ -268,7 +324,7 @@ function cwdArg(args) {
   return cwd;
 }
 
-async function handleSend({ backendName, backend, args, env }) {
+async function handleSend({ backendName, backend, args, env, clientName }) {
   const message = requireString(args, "message", { nonEmpty: true, maxLength: 1000000 });
   const cwd = cwdArg(args);
   const sessionId = optionalString(args, "session_id", {
@@ -372,12 +428,30 @@ async function handleSend({ backendName, backend, args, env }) {
   });
 
   const snapshot = runs.getRunSnapshot({ root, backend: backendName, runId, includeReply: false });
-  return {
+  const result = {
     run_id: runId,
     state: snapshot ? snapshot.state : "queued",
     run_dir: runDir,
     backend: backendName,
   };
+  if (isCodexClient(clientName)) {
+    result.hint =
+      "Run started. Call " +
+      backendName +
+      "_wait with this run_id (you can pass a long timeout_s up to 3600) to collect the final result without polling " +
+      backendName +
+      "_status.";
+  } else {
+    result.wait_command = buildWaitCommand({ backendName, runId, root, env });
+    result.hint = isClaudeClient(clientName)
+      ? "Run started. Run wait_command via Bash with run_in_background: true (no polling): it blocks until the run finishes or stalls, prints the result JSON, and wakes you automatically when it exits. Fall back to " +
+        backendName +
+        "_wait only if background shell commands are unavailable."
+      : "Run started. If your client wakes you when a background shell command exits (Claude Code: Bash with run_in_background: true; Antigravity: run_command with WaitMsBeforeAsync: 500), run wait_command in the background with no polling: it blocks until the run finishes or stalls, prints the result JSON, and notifies you automatically on exit. Otherwise call " +
+        backendName +
+        "_wait with this run_id.";
+  }
+  return result;
 }
 
 async function handleSay({ backendName, args, env }) {
@@ -418,12 +492,15 @@ async function handleSay({ backendName, args, env }) {
   return payload;
 }
 
-async function handleWait({ backendName, args, env }) {
+async function handleWait({ backendName, args, env, clientName, progress, signal }) {
   const runId = runIdArg(args);
-  const timeoutS = integerArg(args, "timeout_s", { min: 1, max: 540, defaultValue: 240 });
+  const defaultTimeoutS = isCodexClient(clientName) ? 1800 : 240;
+  const timeoutS = integerArg(args, "timeout_s", { min: 1, max: 3600, defaultValue: defaultTimeoutS });
   const explicitStallS = integerArg(args, "stall_s", { min: 1, max: 86400 });
   const root = runs.resolveRoot(env);
-  const deadline = Date.now() + timeoutS * 1000;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutS * 1000;
+  let lastProgressAt = startedAt;
   let snapshot = runs.getRunSnapshot({ root, backend: backendName, runId, includeReply: true });
   if (!snapshot) throw new ToolInputError("Run not found: " + runId);
   const stallS = explicitStallS !== undefined ? explicitStallS : snapshot.stall_s || null;
@@ -439,6 +516,7 @@ async function handleWait({ backendName, args, env }) {
   };
 
   while (true) {
+    if (signal && signal.aborted) return runs.formatToolPayload(snapshot);
     if (runs.TERMINAL_STATES.has(snapshot.state)) return runs.formatToolPayload(snapshot);
     // A chat run idling inside its grace window is waiting for user input on
     // purpose; calling that a stall would be a false positive.
@@ -446,7 +524,12 @@ async function handleWait({ backendName, args, env }) {
     if (stallS && snapshot.state === "running" && !waitingForInput && Number.isFinite(snapshot.idle_s) && snapshot.idle_s > stallS) {
       return stalledPayload();
     }
-    const remaining = deadline - Date.now();
+    const now = Date.now();
+    if (progress && now - lastProgressAt >= 10000) {
+      lastProgressAt = now;
+      progress(Math.round((now - startedAt) / 1000), "run " + runId + " is " + snapshot.state);
+    }
+    const remaining = deadline - now;
     if (remaining <= 0) {
       const payload = runs.formatToolPayload(snapshot);
       payload.timed_out = true;
@@ -506,13 +589,13 @@ const HANDLERS = {
   list_models: handleListModels,
 };
 
-export async function callTool({ backendName, name, args, env = process.env }) {
+export async function callTool({ backendName, name, args, env = process.env, clientName = null, progress, signal }) {
   const backend = getBackend(backendName);
   if (!backend) return toolErrorResult("Unknown backend: " + backendName);
   const prefix = backendName + "_";
   const suffix = typeof name === "string" && name.startsWith(prefix) ? name.slice(prefix.length) : null;
   const handler = suffix ? HANDLERS[suffix] : null;
-  const advertised = suffix ? buildDefinition(backendName).some((definition) => definition.suffix === suffix) : false;
+  const advertised = suffix ? buildDefinition(backendName, { clientName }).some((definition) => definition.suffix === suffix) : false;
   if (!handler || !advertised) {
     return toolErrorResult("Unknown tool for the " + backendName + " backend: " + String(name));
   }
@@ -523,7 +606,7 @@ export async function callTool({ backendName, name, args, env = process.env }) {
     return toolErrorResult(error.message);
   }
   try {
-    const payload = await handler({ backendName, backend, args: parsed, env });
+    const payload = await handler({ backendName, backend, args: parsed, env, clientName, progress, signal });
     return toolOkResult(payload);
   } catch (error) {
     if (error instanceof ToolInputError) return toolErrorResult(error.message);

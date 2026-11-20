@@ -1,13 +1,14 @@
 # cli-baton
 
-零依赖的 Node.js ESM **MCP stdio 服务器**：把任务交给本机的 `agy` / `codex` 命令行 AI 代理异步执行，并把结果以 JSON 形式回传给 MCP 客户端（Claude Code、Claude Desktop 等）。
+零依赖的 Node.js ESM **MCP stdio 服务器**：把任务交给本机的 `agy` / `codex` / `claude` 命令行 AI 代理异步执行，并把结果以 JSON 形式回传给 MCP 客户端（Claude Code、Claude Desktop、Antigravity、Codex 等）。
 
-一个 MCP 工具调用只负责**提交任务**并立即拿到 `run_id`；真正的 CLI 进程由脱离 MCP 进程的 supervisor 在后台执行。因此即使 MCP 服务器重启、客户端断开，正在运行的任务也不会丢失——重新连接后用 `run_id` 继续 `wait` / `status` 即可。
+一个 MCP 工具调用只负责**提交任务**并立即拿到 `run_id`（以及供后台唤醒用的 `wait_command`）；真正的 CLI 进程由脱离 MCP 进程的 supervisor 在后台执行。因此即使 MCP 服务器重启、客户端断开，正在运行的任务也不会丢失——重新连接后用 `run_id` 继续 `wait` / `status` 即可。
 
 - 后端 `agy` → serverInfo.name 为 `agy-baton`，工具前缀 `agy_`
 - 后端 `codex` → serverInfo.name 为 `codex-baton`，工具前缀 `codex_`
+- 后端 `claude` → serverInfo.name 为 `claude-baton`，工具前缀 `claude_`
 
-这是通用 CLI 调用与任务管理工具，不包含论文修改等领域专用流程。两个后端可按需单独配置；每位使用者需要安装并登录自己的 CLI，使用自己的账号和配额。
+这是通用 CLI 调用与任务管理工具，不包含论文修改等领域专用流程。三个后端可按需单独配置（例如三方互调：Claude 配 `agy`+`codex`，Codex 配 `agy`+`claude`，Antigravity 配 `codex`+`claude`）；每位使用者需要安装并登录自己的 CLI，使用自己的账号和配额。
 
 ## 快速开始
 
@@ -28,13 +29,13 @@
 ## 简介 / 特性
 
 - **零依赖**：只用 Node.js 内置模块，无需 `npm install`；要求 Node.js >= 18。
-- **双后端、一套接口**：agy 与 codex 的工具形状完全一致，仅前缀不同；核心不含任何后端专有逻辑。
-- **异步任务模型**：`<p>_send` 立即返回，`<p>_wait` 阻塞等待、`<p>_status` 轮询、`<p>_cancel` 取消、`<p>_list_runs` 列出历史。
+- **三后端、一套接口**：`agy`、`codex`、`claude` 的工具形状完全一致，仅前缀不同；核心不含任何后端专有逻辑。
+- **异步任务模型 + 后台自动唤醒**：`<p>_send` 立即返回 `run_id`；对支持后台命令退出唤醒的客户端（Claude Code / Antigravity），同时返回 `wait_command`（`node src/cli.mjs wait --backend <p> <run_id>`），放后台运行后任务结束或卡死时自动唤醒调用方，无需轮询；对 Codex 等无后台唤醒的客户端，`<p>_wait` 支持最高 3600 秒长等待与 MCP `notifications/progress` 保活。
 - **后台 detached supervisor**：MCP 服务器重启/退出不影响运行中的任务；重启后仍可继续查询。
 - **会话恢复**：把上一条运行返回的 `session_id` 传给下一次 `send`，即可在同一会话中继续对话。
 - **完整可观测性**：状态机、stdout 原始事件尾行、stderr 尾部、usage、run 目录落盘。
 - **实时进度窗口（macOS）**：每个 run 自动开一个 Terminal 窗口跟随 `stdout.jsonl`，逐字显示 CLI 正在写的内容；终态自动关窗；`CLI_BATON_VIEWER=0` 可关闭。
-- **对话模式（两个后端）**：窗口里（或 `<p>_say`）可以随时插话，每个回合各有一条 `turns[]` 记录。agy 保持一个长连接进程（消息写 stdin），**一段对话最多 2 轮**（`CLI_BATON_AGY_MAX_TURNS` 可改）；codex 每个 turn 一个新进程（`exec resume <thread_id>`），**轮数不限**。没有窗口时**不进入等待输入的宽限期**，最后一个 turn 结束即完成（其间仍可用 `<p>_say` 追加消息）。
+- **对话模式（三个后端）**：窗口里（或 `<p>_say`）可以随时插话，每个回合各有一条 `turns[]` 记录。`agy` 与 `claude` 保持长连接进程（消息写 stdin），其中 `agy` **一段对话最多 2 轮**（`CLI_BATON_AGY_MAX_TURNS` 可改），`claude` 与 `codex`（每个 turn `exec resume <thread_id>`）**轮数不限**。没有窗口时**不进入等待输入的宽限期**，最后一个 turn 结束即完成（其间仍可用 `<p>_say` 追加消息）。
 - **卡死检测**：`_status` / `_wait` 返回 `idle_s`、`stdout_bytes`、`event_count`、`last_event`；配 `stall_s` 时 `_wait` 在长时间无输出后立即返回 `stalled: true`（不杀进程）。
 - **权限可控**：默认 `access=full`（两个后端一致），也可显式指定 `read-only`。
 - **本地记录与部分脱敏**：不主动序列化环境变量；返回的错误和日志尾部按规则脱敏，完整回复与原始日志不保证脱敏；超长回复截断并落盘完整版本；状态目录 0700、文件 0600。
@@ -64,12 +65,14 @@ runner ──osascript──▶ src/viewer-window.mjs（macOS 弹窗/关窗）�
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/server.mjs` | MCP stdio 协议循环（逐行 JSON-RPC）+ `--backend` 分发。stdout 只输出协议消息，日志走 stderr。 |
-| `src/tools.mjs` | 工具 schema/annotations、参数校验、工具处理函数。 |
+| `src/server.mjs` | MCP stdio 协议循环（逐行 JSON-RPC）+ `--backend` 分发 + 客户端识别 / `notifications/progress` / `notifications/cancelled`。stdout 只输出协议消息，日志走 stderr。 |
+| `src/cli.mjs` | 命令行阻塞等待与状态查询入口（`node src/cli.mjs wait --backend <agy\|codex\|claude> <run_id>`），供支持后台命令退出唤醒的客户端（Claude Code / Antigravity）零轮询自动唤醒。 |
+| `src/tools.mjs` | 工具 schema/annotations、参数校验、工具处理函数与 `wait_command` 生成。 |
 | `src/runs.mjs` | run 存储布局与权限、原子 JSON 写入、状态解析（supervisor pid + start token / 心跳 → interrupted）、列表、取消、脱敏、回复截断。 |
 | `src/runner.mjs` | detached supervisor：在独立进程组中启动 CLI、流式写 `stdout.jsonl` / `stderr.log`、执行超时（SIGTERM → SIGKILL）、写 `reply.txt` / `result.json`。 |
 | `src/backends/agy.mjs` | agy 适配器：可执行文件发现、argv 构造、输出解析、模型列表。 |
 | `src/backends/codex.mjs` | codex 适配器：可执行文件发现、argv 构造、输出解析、模型列表。 |
+| `src/backends/claude.mjs` | claude 适配器：可执行文件发现、stream-json 对话调用、`CLAUDECODE` 清理、输出解析与 `--help` 别名解析。 |
 | `src/backends/index.mjs` | 极简注册表：后端名 → adapter。 |
 | `src/viewer.mjs` | 实时进度查看器（`node src/viewer.mjs <run_dir>`）：跟随 `stdout.jsonl` / `stderr.log`，把 agy 的 `stream-json` 事件与 codex 的 `--json` 事件渲染成人能读的文字，终态后自行退出。 |
 | `src/chat.mjs` | 与后端无关的对话层：`inbox.jsonl` 跟随、排队、`turns`、宽限期策略（`CLI_BATON_CHAT_GRACE_S`）、agy 的 stdin 消息格式。 |
@@ -94,6 +97,7 @@ runner ──osascript──▶ src/viewer-window.mjs（macOS 弹窗/关窗）�
 ```bash
 node /abs/path/src/server.mjs --backend agy     # serverInfo.name = agy-baton
 node /abs/path/src/server.mjs --backend codex   # serverInfo.name = codex-baton
+node /abs/path/src/server.mjs --backend claude  # serverInfo.name = claude-baton
 ```
 
 缺少或非法的 `--backend` 会以非零退出码结束，并把原因写到 stderr。
@@ -130,6 +134,37 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
     "codex-baton": {
       "command": "node",
       "args": ["/abs/path/src/server.mjs", "--backend", "codex"]
+    }
+  }
+}
+```
+
+### Codex（`~/.codex/config.toml`）
+
+```toml
+[mcp_servers.agy-baton]
+command = "/opt/homebrew/bin/node"
+args = ["/abs/path/src/server.mjs", "--backend", "agy"]
+tool_timeout_sec = 3600
+
+[mcp_servers.claude-baton]
+command = "/opt/homebrew/bin/node"
+args = ["/abs/path/src/server.mjs", "--backend", "claude"]
+tool_timeout_sec = 3600
+```
+
+### Antigravity（`~/.gemini/config/mcp_config.json`）
+
+```json
+{
+  "mcpServers": {
+    "codex-baton": {
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/abs/path/src/server.mjs", "--backend", "codex"]
+    },
+    "claude-baton": {
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/abs/path/src/server.mjs", "--backend", "claude"]
     }
   }
 }
@@ -190,7 +225,7 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- | --- |
 | `run_id` | string | ✅ | — | `send` 返回的 id。 |
-| `timeout_s` | number | — | `240` | 本次**等待**的切片时长，范围 1..540；它不会终止 run。超时返回时带 `timed_out: true`，继续调用即可。 |
+| `timeout_s` | number | — | `240`（Codex 为 `1800`） | 本次**等待**的切片时长，范围 1..3600；它不会终止 run。超时返回时带 `timed_out: true`，继续调用即可。 |
 | `stall_s` | number | — | 沿用 run 上记录的值 | 卡死判定阈值（秒）；运行中且 `idle_s > stall_s` 时立即返回 `stalled: true`（不杀进程），便于上层决定“继续等 / 取消”。 |
 
 返回字段：
@@ -282,10 +317,10 @@ claude mcp add codex-baton -- node /abs/path/src/server.mjs --backend codex
 
 > **重要：两个后端默认都是 `access=full`**（包括 codex，新会话与 resume 一致）。`full` 意味着 CLI 可以在本机执行命令、读写文件。如果只想做分析，请显式传 `access: "read-only"`。
 
-| access | agy | codex |
-| --- | --- | --- |
-| `full`（默认） | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox`（新会话与 `exec resume` 均使用） |
-| `read-only`（显式） | `--mode plan` | `-c sandbox_mode="read-only" -c approval_policy="never"` |
+| access | agy | codex | claude |
+| --- | --- | --- | --- |
+| `full`（默认） | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox`（新会话与 `exec resume` 均使用） | `--dangerously-skip-permissions` |
+| `read-only`（显式） | `--mode plan` | `-c sandbox_mode="read-only" -c approval_policy="never"` | `--permission-mode plan` |
 
 - 默认值特意选择 `full`：作为“任务执行代理”，写文件、跑命令是常见需求。
 - `read-only` 只会在你显式传入时生效，用于让 CLI 在只读/计划模式下工作。
@@ -414,6 +449,7 @@ CLI 有可能长时间没有任何输出。supervisor 会记录进度，工具�
 | `CLI_BATON_HOME` | 存储根目录，默认 `~/.cli-baton`。 |
 | `AGY_BIN` | agy 可执行文件路径覆盖。不设置时依次查找：`PATH` → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`。 |
 | `CODEX_BIN` | codex 可执行文件路径覆盖。查找顺序同 `AGY_BIN`。 |
+| `CLAUDE_BIN` | claude 可执行文件路径覆盖。查找顺序同 `AGY_BIN`。 |
 | `CLI_BATON_VIEWER` | `0` / `false` / `off` / `no` 时关闭 macOS 实时进度窗口；默认开启（非 macOS 永远不弹）。 |
 | `CLI_BATON_OSASCRIPT_BIN` | 覆盖 `osascript` 可执行文件路径（测试/调试用）。 |
 | `CLI_BATON_VIEWER_POLL_MS` | viewer 的轮询间隔（毫秒，默认 500），主要供测试使用。 |

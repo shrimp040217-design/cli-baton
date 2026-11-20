@@ -8,16 +8,18 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 export const REPO_ROOT = path.resolve(HERE, "..");
 export const SERVER_PATH = path.join(REPO_ROOT, "src", "server.mjs");
+export const CLI_PATH = path.join(REPO_ROOT, "src", "cli.mjs");
 export const VIEWER_PATH = path.join(REPO_ROOT, "src", "viewer.mjs");
 export const FIXTURES_DIR = path.join(HERE, "fixtures");
 export const FAKE_AGY = path.join(FIXTURES_DIR, "fake-agy.mjs");
 export const FAKE_CODEX = path.join(FIXTURES_DIR, "fake-codex.mjs");
+export const FAKE_CLAUDE = path.join(FIXTURES_DIR, "fake-claude.mjs");
 export const FAKE_OSASCRIPT = path.join(FIXTURES_DIR, "fake-osascript.mjs");
 
 export const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "timed_out", "interrupted"]);
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-for (const fixture of [FAKE_AGY, FAKE_CODEX, FAKE_OSASCRIPT]) {
+for (const fixture of [FAKE_AGY, FAKE_CODEX, FAKE_CLAUDE, FAKE_OSASCRIPT]) {
   try {
     fs.chmodSync(fixture, 0o755);
   } catch {
@@ -69,6 +71,8 @@ export function fakeEnv({
     env.AGY_BIN = FAKE_AGY;
   } else if (backend === "codex") {
     env.CODEX_BIN = FAKE_CODEX;
+  } else if (backend === "claude") {
+    env.CLAUDE_BIN = FAKE_CLAUDE;
   } else {
     throw new Error("unsupported backend: " + backend);
   }
@@ -134,7 +138,7 @@ export class McpClient {
 
   static async start(opts) {
     const client = new McpClient(opts);
-    await client.initialize();
+    await client.initialize(opts && opts.protocolVersion, opts && opts.clientInfo);
     return client;
   }
 
@@ -208,11 +212,11 @@ export class McpClient {
     this.proc.stdin.write(JSON.stringify(payload) + "\n");
   }
 
-  async initialize(protocolVersion = "2025-06-18") {
+  async initialize(protocolVersion = "2025-06-18", clientInfo = { name: "cli-baton-tests", version: "0.0.0" }) {
     const result = await this.request("initialize", {
       protocolVersion,
       capabilities: {},
-      clientInfo: { name: "cli-baton-tests", version: "0.0.0" },
+      clientInfo,
     });
     this.notify("notifications/initialized", {});
     return result;

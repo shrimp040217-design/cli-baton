@@ -108,6 +108,38 @@ export function buildInvocation({ prompt, cwd, sessionId, model, effort, access 
   return { args, stdin: "chat", prompt };
 }
 
+/** One stdin NDJSON user message for agy's `--input-format stream-json`. */
+export function buildUserMessage(text) {
+  return (
+    JSON.stringify({
+      event: "user",
+      message: { content: [{ type: "text", text: String(text) }] },
+    }) + "\n"
+  );
+}
+
+/** Inspect one parsed stdout NDJSON object for an agy turn completion. */
+export function extractTurnResult(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (parsed.event !== "result") return null;
+  const result = parsed.result && typeof parsed.result === "object" ? parsed.result : {};
+  const status = typeof result.status === "string" ? result.status : null;
+  const isError = status !== null && status.toUpperCase() !== "SUCCESS";
+  return {
+    reply: typeof result.response === "string" ? result.response : typeof result.result === "string" ? result.result : "",
+    status,
+    duration_s: typeof result.duration_seconds === "number" ? result.duration_seconds : null,
+    usage: result.usage && typeof result.usage === "object" ? result.usage : null,
+    sessionId:
+      typeof result.conversation_id === "string"
+        ? result.conversation_id
+        : typeof result.session_id === "string"
+          ? result.session_id
+          : null,
+    error: isError ? (result.error !== undefined && result.error !== null ? String(result.error) : "agy reported status " + status) : null,
+  };
+}
+
 function tryParseJson(text) {
   try {
     return JSON.parse(text);
